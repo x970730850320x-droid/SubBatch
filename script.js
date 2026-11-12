@@ -54,10 +54,12 @@ document.addEventListener('DOMContentLoaded', function () {
       formatErrorMessage: '请输入正确的搜索页面地址格式',
     },
   };
-  const EXPORT_FORMAT_VALUES = ['txt', 'srt', 'md', 'doc'];
+  const EXPORT_FORMAT_VALUES = ['txt', 'srt', 'md', 'docx'];
   const EXPORT_MODE_VALUES = ['zip', 'single'];
 
   function normalizeExportFormat(format) {
+    // 旧版 .doc 实际是纯文本，迁移到真正的 Word 文档格式。
+    if (format === 'doc') return 'docx';
     return EXPORT_FORMAT_VALUES.includes(format) ? format : 'txt';
   }
 
@@ -199,6 +201,7 @@ document.addEventListener('DOMContentLoaded', function () {
     { value: 'tags', label: '标签' },
     { value: 'description', label: '视频简介' },
   ];
+  const DEFAULT_VIDEO_INFO_FIELDS = ['title', 'link', 'author', 'publishDate'];
 
   // 显示错误提示
   function showError(message) {
@@ -275,13 +278,17 @@ document.addEventListener('DOMContentLoaded', function () {
   }
 
   function isTranscribedSubtitle(video) {
-    return ['已获取AI字幕', '转写字幕'].includes(video?.subtitleStatus);
+    return ['已获取AI字幕', '转写字幕', '部分转写'].includes(video?.subtitleStatus);
+  }
+
+  function isPartialTranscription(video) {
+    return video?.transcriptionReport?.status === 'partial' || video?.subtitleStatus === '部分转写';
   }
 
   function hasSubtitleContent(video) {
     return !!(
       video &&
-      isSubtitleSuccessStatus(video.subtitleStatus) &&
+      (isSubtitleSuccessStatus(video.subtitleStatus) || isPartialTranscription(video)) &&
       ((video.subtitleText && video.subtitleText.trim() !== '') || hasSubtitleTracks(video))
     );
   }
@@ -302,6 +309,8 @@ document.addEventListener('DOMContentLoaded', function () {
     video.subtitleTrackContents = {};
     video.transcribedLanguage = null;
     video.transcribedLanguageName = null;
+    video.transcriptionStatus = null;
+    video.transcriptionReport = null;
     video.isChargeExclusive = true;
     video.blockReason = CHARGE_EXCLUSIVE_BLOCK_REASON;
   }
@@ -370,6 +379,13 @@ document.addEventListener('DOMContentLoaded', function () {
   }
 
   function getSubtitleStatusDisplayText(video) {
+    if (isPartialTranscription(video)) {
+      const report = video.transcriptionReport;
+      return report
+        ? `部分转写（${report.successfulChunks}/${report.totalChunks} 块完成）`
+        : '部分转写（内容不完整）';
+    }
+
     if (isTranscribedSubtitle(video)) {
       return '转写字幕';
     }
@@ -490,10 +506,12 @@ document.addEventListener('DOMContentLoaded', function () {
   }
 
   function upsertTranscribedSubtitleTrack(video, result) {
-    if (!video || !result?.srtContent) return null;
+    if (!video || !result?.srtContent || result.transcriptionReport?.status === 'failed') return null;
 
     const language = normalizeWhisperLanguageCode(result.language);
     const languageName = result.languageName || getTranscriptionLanguageName(language);
+    const transcriptionReport = result.transcriptionReport || null;
+    const transcriptionStatus = transcriptionReport?.status || result.transcriptionStatus || 'complete';
     const track = {
       trackId: LOCAL_TRANSCRIPTION_TRACK_ID,
       index: 0,
@@ -504,6 +522,8 @@ document.addEventListener('DOMContentLoaded', function () {
       type: 'transcribed',
       source: LOCAL_TRANSCRIPTION_SOURCE,
       isTranscribed: true,
+      transcriptionStatus,
+      transcriptionReport,
     };
 
     const originalTracks = Array.isArray(video.subtitleTracks)
@@ -515,19 +535,43 @@ document.addEventListener('DOMContentLoaded', function () {
     video.subtitleTrackContents = video.subtitleTrackContents || {};
     video.subtitleTrackContents[track.trackId] = {
       success: true,
+      transcriptionStatus,
+      transcriptionReport,
       subtitleText: result.srtContent,
       subtitles: result.chunks || [],
       metadata: {
         lan: language,
         lan_doc: languageName,
         source: LOCAL_TRANSCRIPTION_SOURCE,
+        transcriptionStatus,
+        transcriptionReport,
       },
     };
     video.subtitleText = result.srtContent;
     video.transcribedLanguage = language;
     video.transcribedLanguageName = languageName;
+    video.transcriptionStatus = transcriptionStatus;
+    video.transcriptionReport = transcriptionReport;
+    video.subtitleStatus = transcriptionStatus === 'partial' ? '部分转写' : '转写字幕';
 
     return track;
+  }
+
+  function applyTranscriptionResult(video, result) {
+    const report = result?.transcriptionReport;
+    if (report?.status === 'failed' || result?.transcriptionStatus === 'failed') {
+      const error = new Error('所有音频分块均转写失败，未生成完整字幕');
+      error.transcriptionReport = report;
+      throw error;
+    }
+    if (!String(result?.srtContent || '').trim()) {
+      const error = new Error('未识别到可导出的文字，请检查音频内容');
+      error.transcriptionReport = report;
+      throw error;
+    }
+
+    upsertTranscribedSubtitleTrack(video, result);
+    return video.transcriptionStatus;
   }
 
   function sanitizeLanguageSuffix(languageName) {
@@ -784,12 +828,16 @@ document.addEventListener('DOMContentLoaded', function () {
         const languageName = getSubtitleLanguageName(track);
         video.subtitleTrackContents[trackId] = {
           success: true,
+          transcriptionStatus: track.transcriptionStatus || video.transcriptionStatus,
+          transcriptionReport: track.transcriptionReport || video.transcriptionReport,
           subtitleText: video.subtitleText,
           subtitles: [],
           metadata: {
             lan: language,
             lan_doc: languageName,
             source: LOCAL_TRANSCRIPTION_SOURCE,
+            transcriptionStatus: track.transcriptionStatus || video.transcriptionStatus,
+            transcriptionReport: track.transcriptionReport || video.transcriptionReport,
           },
         };
         return video.subtitleTrackContents[trackId];
@@ -1703,7 +1751,8 @@ document.addEventListener('DOMContentLoaded', function () {
 
       // 创建Blob对象
       await ensureVideoExportMetadata(currentVideoInfo);
-      const finalText = prependVideoInfoText(subtitleText, currentVideoInfo);
+      let finalText = prependVideoInfoText(convertToTxtFormat(subtitleText), currentVideoInfo);
+      finalText = prependTranscriptionWarning(finalText, currentSubtitleData.transcriptionReport);
       const blob = new Blob([finalText], { type: 'text/plain;charset=utf-8' });
 
       // 创建下载链接
@@ -2858,7 +2907,7 @@ document.addEventListener('DOMContentLoaded', function () {
     // 有视频时显示计数信息
     document.getElementById('videoCountInfo').style.display = 'inline';
     // 计算已获取字幕的视频数量
-    const completedCount = videoList.filter((video) => hasSubtitleContent(video)).length;
+    const completedCount = videoList.filter((video) => hasSubtitleContent(video) && !isPartialTranscription(video)).length;
 
     // 更新计数器显示
     document.getElementById('totalVideoCount').textContent = videoList.length.toString();
@@ -2871,19 +2920,22 @@ document.addEventListener('DOMContentLoaded', function () {
 
       // 根据字幕状态设置样式
       let subtitleStatusHtml = '';
-      if (isSubtitleSuccessStatus(video.subtitleStatus)) {
+      if (isPartialTranscription(video)) {
+        const warning = formatTranscriptionReportSummary(video.transcriptionReport);
+        subtitleStatusHtml = `<span style="color: #ad6800; font-weight: 500;" title="${escapeHtml(warning)}">⚠ ${escapeHtml(getSubtitleStatusDisplayText(video))}</span>`;
+      } else if (isSubtitleSuccessStatus(video.subtitleStatus)) {
         // 已获取状态显示为绿色并添加✅图标
-        subtitleStatusHtml = `<span style="color: #52c41a; font-weight: 500;">✅ ${getSubtitleStatusDisplayText(video)}</span>`;
+        subtitleStatusHtml = `<span style="color: #52c41a; font-weight: 500;">✅ ${escapeHtml(getSubtitleStatusDisplayText(video))}</span>`;
       } else if (video.subtitleStatus === '获取中' || video.subtitleStatus === 'AI转写中' || video.subtitleStatus === '转写中') {
         // 获取中状态显示为蓝色带动画
         const pendingStatusText = video.subtitleStatus === 'AI转写中' ? '转写中' : video.subtitleStatus;
         subtitleStatusHtml = `<span style="color: #1890ff; display: flex; align-items: center;">
           <svg viewBox="0 0 24 24" style="width: 16px; height: 16px; margin-right: 4px; animation: spin 1.5s linear infinite;">
             <path d="M12 6v3l4-4-4-4v3c-4.42 0-8 3.58-8 8 0 1.57.46 3.03 1.24 4.26L6.7 14.8c-.45-.83-.7-1.79-.7-2.8 0-3.31 2.69-6 6-6zm6.76 1.74L17.3 9.2c.44.84.7 1.79.7 2.8 0 3.31-2.69 6-6 6v-3l-4 4 4 4v-3c4.42 0 8-3.58 8-8 0-1.57-.46-3.03-1.24-4.26z" fill="currentColor"/>
-          </svg>${pendingStatusText}</span>`;
+          </svg>${escapeHtml(pendingStatusText)}</span>`;
       } else if (video.subtitleStatus === '未获取') {
         // 未获取状态显示为灰色
-        subtitleStatusHtml = `<span style="color: #666;">${video.subtitleStatus}</span>`;
+        subtitleStatusHtml = `<span style="color: #666;">${escapeHtml(video.subtitleStatus)}</span>`;
       } else if (
         video.subtitleStatus &&
         (video.subtitleStatus.includes('信息不完整') ||
@@ -2893,16 +2945,17 @@ document.addEventListener('DOMContentLoaded', function () {
           video.subtitleStatus.includes('失败'))
       ) {
         // 失败状态显示为红色
-        subtitleStatusHtml = `<span style="color: #ff4d4f;">${video.subtitleStatus}</span>`;
+        subtitleStatusHtml = `<span style="color: #ff4d4f;">${escapeHtml(video.subtitleStatus)}</span>`;
       } else {
         // 其他状态保持默认
-        subtitleStatusHtml = video.subtitleStatus;
+        subtitleStatusHtml = escapeHtml(video.subtitleStatus);
       }
 
       // 构建视频链接，如果有分P则添加p参数
-      let videoUrl = `https://www.bilibili.com/video/${video.bvid}`;
-      if (video.page && video.page > 1) {
-        videoUrl += `?p=${video.page}`;
+      let videoUrl = `https://www.bilibili.com/video/${encodeURIComponent(String(video.bvid ?? ''))}`;
+      const page = Number(video.page);
+      if (Number.isSafeInteger(page) && page > 1) {
+        videoUrl += `?p=${page}`;
       }
 
       // 构建操作按钮HTML
@@ -2930,9 +2983,9 @@ document.addEventListener('DOMContentLoaded', function () {
 
       row.innerHTML = `
         <td>${index + 1}</td>
-        <td><a href="${videoUrl}" target="_blank" title="${video.title}">${video.title}</a></td>
-        <td><a href="https://space.bilibili.com/${video.mid}" target="_blank" title="${video.author}">${
-          video.author
+        <td><a href="${escapeHtml(videoUrl)}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(video.title)}">${escapeHtml(video.title)}</a></td>
+        <td><a href="https://space.bilibili.com/${escapeHtml(encodeURIComponent(String(video.mid ?? '')))}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(video.author)}">${
+          escapeHtml(video.author)
         }</a></td>
         <td style="text-align: center;">${formatDate(video.publishDate)}</td>
         <td>${subtitleStatusHtml}</td>
@@ -2982,6 +3035,7 @@ document.addEventListener('DOMContentLoaded', function () {
         try {
           let subtitleText = video.subtitleText;
           let subtitleLanguage = isTranscribedSubtitle(video) ? video.transcribedLanguage : null;
+          let transcriptionReport = video.transcriptionReport;
 
           if (hasSubtitleTracks(video)) {
             const selectedTracks = getSelectedSubtitleTracks(video);
@@ -2993,6 +3047,7 @@ document.addEventListener('DOMContentLoaded', function () {
             const subtitleContent = await getSubtitleContentForTrack(video, selectedTracks[0]);
             subtitleText = subtitleContent.subtitleText;
             subtitleLanguage = getSubtitleTrackLanguageCode(selectedTracks[0]);
+            transcriptionReport = subtitleContent.transcriptionReport;
           }
 
           // 转换为TXT格式
@@ -3001,6 +3056,7 @@ document.addEventListener('DOMContentLoaded', function () {
           // 添加视频信息前缀
           await ensureVideoExportMetadata(video);
           txtContent = prependVideoInfoText(txtContent, video);
+          txtContent = prependTranscriptionWarning(txtContent, transcriptionReport);
 
           // 复制到剪贴板
           await navigator.clipboard.writeText(txtContent);
@@ -3521,190 +3577,193 @@ document.addEventListener('DOMContentLoaded', function () {
   // 音频转字幕按钮事件监听
   if (transcribeAudioBtn) {
     console.log('添加音频转字幕按钮事件监听');
-    transcribeAudioBtn.addEventListener('click', async function () {
-      console.log('音频转字幕按钮被点击');
-
-      // 检查是否有视频在表格中
-      if (videoList.length === 0) {
-        showError('请先添加视频到表格');
-        return;
-      }
-
-      const videosToTranscribe = videoList.filter((video) => shouldAttemptAudioTranscription(video));
-      if (videosToTranscribe.length === 0) {
-        showError('没有需要转写的无字幕视频（所有视频都已获取字幕、信息不完整或充电专属不可获取）');
-        return;
-      }
-
-      let dialogResult = { confirmed: true, skipFuture: false };
-      if (!skipTranscribeConfirmDialog) {
-        dialogResult = await showTranscribeConfirmDialog(videosToTranscribe.length);
-      }
-
-      if (!dialogResult.confirmed) {
-        return;
-      }
-
-      if (dialogResult.skipFuture) {
-        skipTranscribeConfirmDialog = true;
-        chrome.storage.local.set({ skipTranscribeConfirmDialog: true });
-      }
-
-      // 显示进度
-      showProgress(true);
-      setTranscribeProgressReminderVisible(true);
-      updateProgress(0, '准备转写无字幕视频...');
-      setTranscribeAudioButtonLoading(true);
-
-      try {
-        showSuccess(`开始批量转写无字幕视频，共 ${videosToTranscribe.length} 个视频...`);
-
-        // 优先使用任意已打开的 B站页面通过页面上下文下载音频；没有时让后台尝试直接下载。
-        const bilibiliTab = await getCurrentBilibiliVideoTab();
-        console.log('B站 标签页:', bilibiliTab?.url, 'ID:', bilibiliTab?.id);
-
-        if (!bilibiliTab) {
-          console.warn('未找到已打开的 B站页面标签页，将尝试直接下载音频');
-          showError('未找到已打开的 B站页面，将尝试直接下载音频；若失败请先打开任意 B站页面后重试');
-        }
-
-        let successCount = 0;
-        let failCount = 0;
-        let skippedCount = 0;
-
-        for (let i = 0; i < videosToTranscribe.length; i++) {
-          const videoToTranscribe = videosToTranscribe[i];
-          setTranscribeProgressContext(i, videosToTranscribe.length);
-
-          try {
-            const executionInfo = await refreshVideoExecutionInfo(videoToTranscribe, { allowFallbackCid: false });
-            if (executionInfo.success) {
-              videoToTranscribe.isChargeExclusive = !!executionInfo.info?.isChargeExclusive;
-              videoToTranscribe.blockReason = executionInfo.info?.blockReason;
-            }
-
-            if (executionInfo.isChargeExclusive) {
-              markVideoAsChargeExclusive(videoToTranscribe);
-              skippedCount++;
-              updateVideoTable();
-              continue;
-            }
-
-            if (videoToTranscribe.duration && videoToTranscribe.duration > 3600) {
-              videoToTranscribe.subtitleStatus = '转写失败: 视频超过60分钟';
-              failCount++;
-              updateVideoTable();
-              continue;
-            }
-
-            videoToTranscribe.subtitleStatus = '转写中';
-            updateVideoTable();
-            updateTranscribeProgress(0, `准备转写：${videoToTranscribe.title}`);
-
-            const hasCid = await ensureVideoCid(videoToTranscribe);
-            if (!hasCid) {
-              videoToTranscribe.subtitleStatus = '信息不完整: 无法准确匹配CID';
-              failCount++;
-              updateVideoTable();
-              continue;
-            }
-
-            // 发送转写请求（包括 tabId）
-            const response = await chrome.runtime.sendMessage({
-              action: 'transcribeAudio',
-              bvid: videoToTranscribe.bvid,
-              cid: videoToTranscribe.cid,
-              tabId: bilibiliTab?.id || null,
-            });
-
-            console.log('音频转写响应:', response);
-
-            if (!response.success) {
-              if (isChargeExclusiveBlockedResponse(response)) {
-                markVideoAsChargeExclusive(videoToTranscribe);
-                skippedCount++;
-              } else {
-                videoToTranscribe.subtitleStatus = `转写失败: ${response.message || '未知错误'}`;
-                failCount++;
-              }
-              updateVideoTable();
-              continue;
-            }
-
-            if (response.stage === 'needs_frontend_processing' && response.audioData) {
-              console.log('需要在前端处理音频，开始解码...');
-              updateTranscribeProgress(50, '在前端解码音频...');
-
-              const audioBuffer = await decodeAudioInFrontend(response.audioData);
-              if (!audioBuffer) {
-                throw new Error('前端音频解码失败');
-              }
-
-              updateTranscribeProgress(60, '音频解码完成，开始转写...');
-
-              const transcribeResult = await transcribeAudioInFrontend(audioBuffer, (progress, msg) => {
-                updateTranscribeProgress(progress, msg || '转写中...');
-              });
-
-              videoToTranscribe.subtitleStatus = '转写字幕';
-              upsertTranscribedSubtitleTrack(videoToTranscribe, {
-                srtContent: transcribeResult.srtContent,
-                chunks: transcribeResult.chunks,
-                language: transcribeResult.language,
-                languageName: transcribeResult.languageName,
-              });
-              successCount++;
-              updateVideoTable();
-              continue;
-            }
-
-            if (response.srtContent) {
-              videoToTranscribe.subtitleStatus = '转写字幕';
-              upsertTranscribedSubtitleTrack(videoToTranscribe, {
-                srtContent: response.srtContent,
-                chunks: response.chunks,
-                language: response.language,
-                languageName: response.languageName,
-              });
-              successCount++;
-              updateVideoTable();
-              continue;
-            }
-
-            videoToTranscribe.subtitleStatus = '转写失败: 转写结果格式不正确';
-            failCount++;
-            updateVideoTable();
-          } catch (itemError) {
-            console.error(`音频转写失败: ${videoToTranscribe.title}`, itemError);
-            videoToTranscribe.subtitleStatus = `转写失败: ${itemError.message || '未知错误'}`;
-            failCount++;
-            updateVideoTable();
-          }
-        }
-
-        clearTranscribeProgressContext();
-        updateProgress(100, '批量转写无字幕视频完成');
-
-        if (successCount > 0 && failCount === 0 && skippedCount === 0) {
-          showSuccess(`批量转写无字幕视频完成，成功 ${successCount} 个视频`);
-        } else if (successCount > 0 || skippedCount > 0) {
-          showSuccess(`批量转写无字幕视频完成，成功 ${successCount} 个，失败 ${failCount} 个，跳过 ${skippedCount} 个`);
-        } else {
-          showError(`批量转写无字幕视频失败，共失败 ${failCount} 个视频`);
-        }
-      } catch (error) {
-        console.error('音频转写出错:', error);
-        showError('转写出错: ' + (error.message || '未知错误'));
-      } finally {
-        clearTranscribeProgressContext();
-        setTranscribeAudioButtonLoading(false);
-        setTimeout(() => {
-          showProgress(false);
-        }, 2000);
-      }
-    });
+    transcribeAudioBtn.addEventListener('click', runAudioTranscription);
   } else {
     console.warn('音频转字幕按钮未找到');
+  }
+
+  async function runAudioTranscription() {
+    console.log('音频转字幕按钮被点击');
+
+    // 检查是否有视频在表格中
+    if (videoList.length === 0) {
+      showError('请先添加视频到表格');
+      return;
+    }
+
+    const videosToTranscribe = videoList.filter((video) => shouldAttemptAudioTranscription(video));
+    if (videosToTranscribe.length === 0) {
+      showError('没有需要转写的无字幕视频（所有视频都已获取字幕、信息不完整或充电专属不可获取）');
+      return;
+    }
+
+    let dialogResult = { confirmed: true, skipFuture: false };
+    if (!skipTranscribeConfirmDialog) {
+      dialogResult = await showTranscribeConfirmDialog(videosToTranscribe.length);
+    }
+
+    if (!dialogResult.confirmed) {
+      return;
+    }
+
+    if (dialogResult.skipFuture) {
+      skipTranscribeConfirmDialog = true;
+      chrome.storage.local.set({ skipTranscribeConfirmDialog: true });
+    }
+
+    // 显示进度
+    showProgress(true);
+    setTranscribeProgressReminderVisible(true);
+    updateProgress(0, '准备转写无字幕视频...');
+    setTranscribeAudioButtonLoading(true);
+
+    try {
+      updateProgress(0, '检查并加载本地转写模型...');
+      await initFrontendWhisper((progress, message) => {
+        updateProgress(progress, message || '加载本地转写模型...');
+      });
+      showSuccess(`开始批量转写无字幕视频，共 ${videosToTranscribe.length} 个视频...`);
+
+      // 优先使用任意已打开的 B站页面通过页面上下文下载音频；没有时让后台尝试直接下载。
+      const bilibiliTab = await getCurrentBilibiliVideoTab();
+      console.log('B站 标签页:', bilibiliTab?.url, 'ID:', bilibiliTab?.id);
+
+      if (!bilibiliTab) {
+        console.warn('未找到已打开的 B站页面标签页，将尝试直接下载音频');
+        showError('未找到已打开的 B站页面，将尝试直接下载音频；若失败请先打开任意 B站页面后重试');
+      }
+
+      let successCount = 0;
+      let partialCount = 0;
+      let failCount = 0;
+      let skippedCount = 0;
+
+      for (let i = 0; i < videosToTranscribe.length; i++) {
+        const videoToTranscribe = videosToTranscribe[i];
+        setTranscribeProgressContext(i, videosToTranscribe.length);
+
+        try {
+          const executionInfo = await refreshVideoExecutionInfo(videoToTranscribe, { allowFallbackCid: false });
+          if (executionInfo.success) {
+            videoToTranscribe.isChargeExclusive = !!executionInfo.info?.isChargeExclusive;
+            videoToTranscribe.blockReason = executionInfo.info?.blockReason;
+          }
+
+          if (executionInfo.isChargeExclusive) {
+            markVideoAsChargeExclusive(videoToTranscribe);
+            skippedCount++;
+            updateVideoTable();
+            continue;
+          }
+
+          if (videoToTranscribe.duration && videoToTranscribe.duration > 3600) {
+            videoToTranscribe.subtitleStatus = '转写失败: 本地音频转写限60分钟，已有字幕仍可获取';
+            videoToTranscribe.transcriptionStatus = 'failed';
+            failCount++;
+            updateVideoTable();
+            continue;
+          }
+
+          videoToTranscribe.subtitleStatus = '转写中';
+          updateVideoTable();
+          updateTranscribeProgress(0, `准备转写：${videoToTranscribe.title}`);
+
+          const hasCid = await ensureVideoCid(videoToTranscribe);
+          if (!hasCid) {
+            videoToTranscribe.subtitleStatus = '信息不完整: 无法准确匹配CID';
+            failCount++;
+            updateVideoTable();
+            continue;
+          }
+
+          // 发送转写请求（包括 tabId）
+          const response = await chrome.runtime.sendMessage({
+            action: 'transcribeAudio',
+            bvid: videoToTranscribe.bvid,
+            cid: videoToTranscribe.cid,
+            tabId: bilibiliTab?.id || null,
+          });
+
+          console.log('音频转写响应:', response);
+
+          if (!response.success) {
+            if (isChargeExclusiveBlockedResponse(response)) {
+              markVideoAsChargeExclusive(videoToTranscribe);
+              skippedCount++;
+            } else {
+              videoToTranscribe.subtitleStatus = `转写失败: ${response.message || '未知错误'}`;
+              videoToTranscribe.transcriptionStatus = 'failed';
+              videoToTranscribe.transcriptionReport = response.transcriptionReport || null;
+              failCount++;
+            }
+            updateVideoTable();
+            continue;
+          }
+
+          if (response.stage === 'needs_frontend_processing' && response.audioData) {
+            console.log('需要在前端处理音频，开始解码...');
+            updateTranscribeProgress(50, '在前端解码音频...');
+
+            const audioBuffer = await decodeAudioInFrontend(response.audioData);
+            if (!audioBuffer) {
+              throw new Error('前端音频解码失败');
+            }
+
+            updateTranscribeProgress(60, '音频解码完成，开始转写...');
+
+            const transcribeResult = await transcribeAudioInFrontend(audioBuffer, (progress, msg) => {
+              updateTranscribeProgress(progress, msg || '转写中...');
+            });
+
+            const status = applyTranscriptionResult(videoToTranscribe, transcribeResult);
+            if (status === 'partial') partialCount++;
+            else successCount++;
+            updateVideoTable();
+            continue;
+          }
+
+          if (response.srtContent) {
+            const status = applyTranscriptionResult(videoToTranscribe, response);
+            if (status === 'partial') partialCount++;
+            else successCount++;
+            updateVideoTable();
+            continue;
+          }
+
+          videoToTranscribe.subtitleStatus = '转写失败: 转写结果格式不正确';
+          videoToTranscribe.transcriptionStatus = 'failed';
+          failCount++;
+          updateVideoTable();
+        } catch (itemError) {
+          console.error(`音频转写失败: ${videoToTranscribe.title}`, itemError);
+          videoToTranscribe.subtitleStatus = `转写失败: ${itemError.message || '未知错误'}`;
+          videoToTranscribe.transcriptionStatus = 'failed';
+          videoToTranscribe.transcriptionReport = itemError.transcriptionReport || null;
+          failCount++;
+          updateVideoTable();
+        }
+      }
+
+      clearTranscribeProgressContext();
+      updateProgress(100, partialCount > 0 ? '批量转写结束（含不完整结果）' : '批量转写无字幕视频结束');
+
+      if (partialCount > 0 || failCount > 0) {
+        showError(`转写结束：完整 ${successCount} 个，部分 ${partialCount} 个，失败 ${failCount} 个，跳过 ${skippedCount} 个。部分结果请核对缺失区间。`);
+      } else if (successCount > 0 || skippedCount > 0) {
+        showSuccess(`转写结束：完整 ${successCount} 个，跳过 ${skippedCount} 个`);
+      } else {
+        showError(`批量转写无字幕视频失败，共失败 ${failCount} 个视频`);
+      }
+    } catch (error) {
+      console.error('音频转写出错:', error);
+      showError('转写出错: ' + (error.message || '未知错误'));
+    } finally {
+      clearTranscribeProgressContext();
+      setTranscribeAudioButtonLoading(false);
+      setTimeout(() => {
+        showProgress(false);
+      }, 2000);
+    }
   }
 
   // 监听转写进度消息
@@ -3737,9 +3796,9 @@ document.addEventListener('DOMContentLoaded', function () {
       const exportFormat = normalizeExportFormat(defaultExportFormat);
       const exportMode = normalizeExportMode(defaultExportMode);
 
-      if (exportMode === 'zip' && typeof JSZip === 'undefined') {
-        console.error('JSZip库未加载，无法执行ZIP导出');
-        showError('JSZip库未加载，无法执行ZIP导出。请确保jszip.min.js文件已正确加载');
+      if ((exportMode === 'zip' || exportFormat === 'docx') && typeof JSZip === 'undefined') {
+        console.error('JSZip库未加载，无法生成ZIP或DOCX文件');
+        showError('JSZip库未加载，无法生成ZIP或DOCX文件。请确保jszip.min.js文件已正确加载');
         return;
       }
 
@@ -3774,6 +3833,16 @@ document.addEventListener('DOMContentLoaded', function () {
     if (!Array.isArray(fields)) return [];
     const fieldSet = new Set(fields);
     return TXT_VIDEO_INFO_FIELD_OPTIONS.map((option) => option.value).filter((value) => fieldSet.has(value));
+  }
+
+  function resolvePrependVideoInfoFields(settings = {}) {
+    if (Array.isArray(settings.prependVideoInfoFields)) {
+      return normalizePrependVideoInfoFields(settings.prependVideoInfoFields);
+    }
+    if (Object.prototype.hasOwnProperty.call(settings, 'prependVideoInfo')) {
+      return settings.prependVideoInfo ? ['title', 'link'] : [];
+    }
+    return [...DEFAULT_VIDEO_INFO_FIELDS];
   }
 
   function getAllTxtVideoInfoFieldValues() {
@@ -3997,7 +4066,7 @@ document.addEventListener('DOMContentLoaded', function () {
     const blob =
       subtitleContent instanceof Blob
         ? subtitleContent
-        : new Blob([subtitleContent], { type: 'text/plain;charset=utf-8' });
+        : new Blob([subtitleContent], { type: getSubtitleMimeType(fileName) });
     const url = URL.createObjectURL(blob);
 
     if (chrome.downloads?.download) {
@@ -4104,9 +4173,11 @@ document.addEventListener('DOMContentLoaded', function () {
       // 依次导出每个字幕文件
       for (const [index, task] of exportTasks.entries()) {
         try {
-          const { video, track, fileName } = task;
+          const { video, track } = task;
           const subtitleSource = track ? await getSubtitleContentForTrack(video, track) : video;
           const subtitleText = subtitleSource.subtitleText;
+          const transcriptionReport = subtitleSource.transcriptionReport;
+          const fileName = markPartialExportFileName(task.fileName, transcriptionReport);
 
           // 根据选择的格式处理字幕内容
           let subtitleContent;
@@ -4123,6 +4194,11 @@ document.addEventListener('DOMContentLoaded', function () {
           if (format !== 'srt') {
             await ensureVideoExportMetadata(video);
             subtitleContent = prependVideoInfoText(subtitleContent, video);
+            subtitleContent = prependTranscriptionWarning(subtitleContent, transcriptionReport);
+          }
+
+          if (format === 'docx') {
+            subtitleContent = await buildDocxDocument(subtitleContent);
           }
 
           if (isZipMode) {
@@ -4130,6 +4206,22 @@ document.addEventListener('DOMContentLoaded', function () {
           } else {
             await triggerSubtitleFileDownload(fileName, subtitleContent);
             await wait(50);
+          }
+
+          // SRT 正文必须保持标准格式，用旁车报告保留缺失区间和失败原因。
+          if (format === 'srt' && transcriptionReport?.status === 'partial') {
+            const reportFileName = `${fileName}.transcription.json`;
+            const reportContent = JSON.stringify({
+              title: video.title || '',
+              sourceUrl: buildExportVideoUrl(video),
+              transcriptionReport,
+            }, null, 2);
+            if (isZipMode) {
+              zipContent.file(reportFileName, reportContent);
+            } else {
+              await triggerSubtitleFileDownload(reportFileName, reportContent);
+              await wait(50);
+            }
           }
           exportedCount++;
 
@@ -4190,96 +4282,133 @@ document.addEventListener('DOMContentLoaded', function () {
     }
   }
 
-  // 将字幕内容转换为SRT格式
-  function convertToSrtFormat(subtitleText) {
-    if (!subtitleText) return '';
-
-    // 将字幕文本按行分割
-    const lines = subtitleText.split('\n');
-    let srtContent = '';
-    let entryNumber = 1; // 序号从1开始
-
-    // 遍历每一行，重新构建标准SRT格式
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i].trim();
-
-      // 如果当前行是时间轴（含 --> 格式的行）
-      if (line.includes(' --> ')) {
-        // 提取并转换时间戳格式
-        const timeParts = line.split(' --> ');
-        if (timeParts.length === 2) {
-          // 替换点号为逗号
-          const startTime = timeParts[0].replace('.', ',');
-          const endTime = timeParts[1].replace('.', ',');
-
-          // 添加序号和修复后的时间轴
-          srtContent += entryNumber + '\n' + startTime + ' --> ' + endTime + '\n';
-        } else {
-          // 如果时间轴格式不正确，保持原样
-          srtContent += entryNumber + '\n' + line + '\n';
-        }
-
-        // 查找后续的内容行，一直到遇到空行或下一个时间轴
-        let contentLines = [];
-        for (let j = i + 1; j < lines.length; j++) {
-          const contentLine = lines[j].trim();
-          if (contentLine === '' || contentLine.includes(' --> ') || /^\d+$/.test(contentLine)) {
-            break; // 遇到空行、时间轴或序号行，结束内容收集
-          }
-          contentLines.push(contentLine);
-          i = j; // 更新外层循环索引
-        }
-
-        // 添加内容行
-        if (contentLines.length > 0) {
-          srtContent += contentLines.join('\n') + '\n\n'; // 内容后添加空行
-          entryNumber++; // 更新序号
-        }
-      }
-    }
-
-    return srtContent.trim();
+  function normalizeSubtitleNewlines(text) {
+    return String(text || '').replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n');
   }
 
-  // 将字幕内容转换为纯文本格式（去除时间戳和序号）
-  function convertToTxtFormat(subtitleText, transcriptionLanguage = null) {
-    if (!subtitleText) return '';
+  function trimEmptyBoundaryLines(lines) {
+    let start = 0;
+    let end = lines.length;
+    while (start < end && lines[start].trim() === '') start++;
+    while (end > start && lines[end - 1].trim() === '') end--;
+    return lines.slice(start, end);
+  }
 
-    const useChineseWrapRules = !transcriptionLanguage || isChineseTranscriptionLanguage(transcriptionLanguage);
+  function parseSubtitleTiming(line) {
+    const match = String(line).match(
+      /^\s*(\d{1,}):([0-5]\d):([0-5]\d)[.,](\d{1,3})\s*-->\s*(\d{1,}):([0-5]\d):([0-5]\d)[.,](\d{1,3})(?:\s+(.*?))?\s*$/,
+    );
+    if (!match) return null;
+    const start = `${match[1].padStart(2, '0')}:${match[2]}:${match[3]},${match[4].padEnd(3, '0')}`;
+    const end = `${match[5].padStart(2, '0')}:${match[6]}:${match[7]},${match[8].padEnd(3, '0')}`;
+    return { start, end, settings: match[9] || '' };
+  }
 
-    // 将字幕文本按行分割
-    const lines = subtitleText.split('\n');
-    let txtContent = '';
-
-    // 遍历每一行，提取内容文本
-    for (let i = 0; i < lines.length; i++) {
-      let line = lines[i].trim();
-
-      // 跳过空行
-      if (line === '') continue;
-
-      // 跳过序号行（纯数字）
-      if (/^\d+$/.test(line)) continue;
-
-      // 跳过时间轴行（含 --> 格式的行）
-      if (line.includes(' --> ')) continue;
-
-      // 清理残余的 <|X.XX|> 时间戳标记；只有中文内容才做繁简转换。
-      line = cleanTranscriptionText(line, { language: transcriptionLanguage });
-
-      if (line) {
-        if (useChineseWrapRules) {
-          // 中文转写继续按语义断句，保持当前更适合中文的阅读观感。
-          const segments = splitTextToSentences(line);
-          txtContent += segments + '\n';
-        } else {
-          // 非中文不套中文 18 字断句规则，保留模型输出的自然片段。
-          txtContent += line + '\n';
-        }
-      }
+  // 只在时间轴前的 cue 头部识别序号；正文里的年份、计数和重复句都保留。
+  function parseSubtitleCues(subtitleText) {
+    const normalized = normalizeSubtitleNewlines(subtitleText);
+    const lines = normalized.split('\n');
+    const headers = [];
+    for (let index = 0; index < lines.length; index++) {
+      const timing = parseSubtitleTiming(lines[index]);
+      if (!timing) continue;
+      const hasSequence = index > 0 && /^\d+$/.test(lines[index - 1].trim()) &&
+        (index === 1 || lines[index - 2].trim() === '');
+      headers.push({ timing, lineIndex: index, headerIndex: hasSequence ? index - 1 : index });
     }
 
-    return useChineseWrapRules ? removeDuplicateTextLines(txtContent) : txtContent.trim();
+    if (headers.length === 0) {
+      return { cues: [], preamble: normalized, text: normalized };
+    }
+
+    const preamble = trimEmptyBoundaryLines(lines.slice(0, headers[0].headerIndex)).join('\n');
+    const cues = headers.map((header, index) => {
+      const nextHeaderIndex = headers[index + 1]?.headerIndex ?? lines.length;
+      const text = trimEmptyBoundaryLines(lines.slice(header.lineIndex + 1, nextHeaderIndex)).join('\n');
+      return { ...header.timing, text };
+    });
+    const text = [preamble, ...cues.map((cue) => cue.text)].filter((value) => value !== '').join('\n');
+    return { cues, preamble, text };
+  }
+
+  function convertToSrtFormat(subtitleText) {
+    if (!subtitleText) return '';
+    const parsed = parseSubtitleCues(subtitleText);
+    if (parsed.cues.length === 0 || parsed.preamble.trim() !== '') {
+      throw new Error('字幕含有未对应时间轴的文字，无法完整导出 SRT；请选择 TXT、MD 或 DOCX');
+    }
+    return parsed.cues.map((cue, index) => {
+      const settings = cue.settings ? ` ${cue.settings}` : '';
+      return `${index + 1}\n${cue.start} --> ${cue.end}${settings}\n${cue.text}`;
+    }).join('\n\n');
+  }
+
+  // TXT、MD、DOCX 和复制共享无损正文路径，不重写繁简、标点或去重。
+  function convertToTxtFormat(subtitleText, transcriptionLanguage = null) {
+    return parseSubtitleCues(subtitleText).text;
+  }
+
+  function getSubtitleMimeType(fileName) {
+    if (/\.docx$/i.test(fileName)) return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+    if (/\.json$/i.test(fileName)) return 'application/json;charset=utf-8';
+    return 'text/plain;charset=utf-8';
+  }
+
+  function escapeDocxXml(text) {
+    // XML 1.0 不允许这些码点；u 模式保留合法代理对，只替换孤立代理码元。
+    return String(text).replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\uD800-\uDFFF\uFFFE\uFFFF]/gu, '\uFFFD')
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&apos;');
+  }
+
+  async function buildDocxDocument(text) {
+    if (typeof JSZip === 'undefined') throw new Error('JSZip库未加载，无法生成DOCX文件');
+    const zip = new JSZip();
+    const paragraphs = normalizeSubtitleNewlines(text).split('\n').map((line) => {
+      const runs = line.split('\t').map((part) => `<w:r><w:t xml:space="preserve">${escapeDocxXml(part)}</w:t></w:r>`);
+      return `<w:p>${runs.join('<w:r><w:tab/></w:r>')}</w:p>`;
+    }).join('');
+    zip.file('[Content_Types].xml', '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+      '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">' +
+      '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>' +
+      '<Default Extension="xml" ContentType="application/xml"/>' +
+      '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>' +
+      '</Types>');
+    zip.file('_rels/.rels', '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+      '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+      '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>' +
+      '</Relationships>');
+    zip.file('word/document.xml', '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+      '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>' +
+      paragraphs + '<w:sectPr><w:pgSz w:w="11906" w:h="16838"/>' +
+      '<w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440"/></w:sectPr>' +
+      '</w:body></w:document>');
+    return zip.generateAsync({ type: 'uint8array', compression: 'DEFLATE' });
+  }
+
+  function markPartialExportFileName(fileName, report) {
+    if (report?.status !== 'partial') return fileName;
+    const dotIndex = fileName.lastIndexOf('.');
+    return dotIndex >= 0 ? `${fileName.slice(0, dotIndex)}_partial${fileName.slice(dotIndex)}` : `${fileName}_partial`;
+  }
+
+  function formatTranscriptionRangeTime(seconds) {
+    const value = Number(seconds);
+    const milliseconds = Number.isFinite(value) ? Math.max(0, Math.round(value * 1000)) : 0;
+    const hours = Math.floor(milliseconds / 3600000).toString().padStart(2, '0');
+    const minutes = Math.floor((milliseconds % 3600000) / 60000).toString().padStart(2, '0');
+    const remainingSeconds = Math.floor((milliseconds % 60000) / 1000).toString().padStart(2, '0');
+    const fraction = milliseconds % 1000;
+    return `${hours}:${minutes}:${remainingSeconds}${fraction ? '.' + String(fraction).padStart(3, '0') : ''}`;
+  }
+
+  function prependTranscriptionWarning(text, report) {
+    if (report?.status !== 'partial') return text;
+    const ranges = Array.isArray(report.missingRanges) ? report.missingRanges : [];
+    const missing = ranges.length > 0
+      ? '\n缺失时间段：' + ranges.map((range) => `${formatTranscriptionRangeTime(range.start)}–${formatTranscriptionRangeTime(range.end)}`).join('、')
+      : '\n存在处理失败的片段，内容完整性未确认。';
+    return `【部分转写：成功 ${report.successfulChunks}/${report.totalChunks} 段，内容不完整】${missing}\n\n${text}`;
   }
 
   const TXT_WRAP_PREFERRED_CHARS = 17;
@@ -4740,7 +4869,7 @@ document.addEventListener('DOMContentLoaded', function () {
   const settingsModalCloseBtn = document.getElementById('settingsModalCloseBtn');
   let defaultExportMode = 'zip';
   let defaultExportFormat = 'txt'; // 默认值
-  let prependVideoInfoFields = [];
+  let prependVideoInfoFields = [...DEFAULT_VIDEO_INFO_FIELDS];
 
   chrome.storage.local.get(['skipTranscribeConfirmDialog'], (result) => {
     skipTranscribeConfirmDialog = !!result.skipTranscribeConfirmDialog;
@@ -5028,12 +5157,10 @@ document.addEventListener('DOMContentLoaded', function () {
   }
 
   chrome.storage.local.get(['prependVideoInfoFields', 'prependVideoInfo'], (result) => {
-    if (Array.isArray(result.prependVideoInfoFields)) {
-      prependVideoInfoFields = normalizePrependVideoInfoFields(result.prependVideoInfoFields);
-    } else if (result.prependVideoInfo) {
-      prependVideoInfoFields = ['title', 'link'];
-    } else {
-      prependVideoInfoFields = [];
+    prependVideoInfoFields = resolvePrependVideoInfoFields(result);
+    if (!Object.prototype.hasOwnProperty.call(result, 'prependVideoInfoFields') &&
+      !Object.prototype.hasOwnProperty.call(result, 'prependVideoInfo')) {
+      chrome.storage.local.set({ prependVideoInfoFields });
     }
 
     syncTxtVideoInfoOptionStates();
@@ -5717,6 +5844,108 @@ let frontendTransformersModule = null;
 // 当前使用的模型名称（用于日志）
 let currentModelName = '';
 
+function getLocalWhisperModelConfigurations() {
+  return [
+    {
+      name: 'whisper-large-v3-turbo',
+      device: 'webgpu',
+      dtype: 'q4f16',
+      files: ['encoder_model_q4f16.onnx', 'decoder_model_merged_q4f16.onnx'],
+    },
+    {
+      name: 'whisper-small',
+      device: 'wasm',
+      dtype: 'q8',
+      files: ['encoder_model_quantized.onnx', 'decoder_model_merged_quantized.onnx'],
+    },
+  ];
+}
+
+async function checkLocalWhisperModel(model) {
+  const files = model.files.map((file) => `models/${model.name}/onnx/${file}`);
+  const checks = await Promise.all(files.map(async (path) => {
+    try {
+      // HEAD 只检查扩展包内的文件，不下载大型权重或访问远程模型站点。
+      const response = await fetch(chrome.runtime.getURL(path), { method: 'HEAD', cache: 'no-store' });
+      return { path, available: response.ok };
+    } catch (error) {
+      return { path, available: false };
+    }
+  }));
+
+  return { ...model, missingFiles: checks.filter((check) => !check.available).map((check) => check.path) };
+}
+
+async function preflightLocalWhisperModels() {
+  const hasWebGPU = await isWebGPUAvailable();
+  const configurations = getLocalWhisperModelConfigurations().filter((model) => model.device !== 'webgpu' || hasWebGPU);
+  const checks = await Promise.all(configurations.map((model) => checkLocalWhisperModel(model)));
+  const availableModels = checks.filter((model) => model.missingFiles.length === 0);
+  if (availableModels.length > 0) return availableModels;
+
+  const recommendedModel = checks.find((model) => model.device === 'wasm') || checks[0];
+  const message = `本地转写模型未安装完整。请把 ${recommendedModel.files.join('、')} 放入 models/${recommendedModel.name}/onnx/，按 README 的模型安装说明补齐配套文件，再重新加载扩展。已有字幕的获取和导出不需要这些模型。`;
+  const error = new Error(message);
+  error.code = 'MISSING_LOCAL_WHISPER_MODEL';
+  error.missingModelFiles = checks.flatMap((model) => model.missingFiles);
+  throw error;
+}
+
+function createTranscriptionReport(chunkAttempts, duration) {
+  const successful = chunkAttempts.filter((chunk) => chunk.success);
+  const failedChunks = chunkAttempts.filter((chunk) => !chunk.success).map((chunk) => ({
+    index: chunk.index,
+    start: chunk.start,
+    end: chunk.end,
+    error: chunk.error || '未知转写错误',
+  }));
+  const missingRanges = [];
+  let coveredUntil = 0;
+  const coverage = successful.slice().sort((left, right) => left.start - right.start);
+  for (const chunk of coverage) {
+    const start = Math.max(0, Math.min(duration, chunk.start));
+    const end = Math.max(start, Math.min(duration, chunk.end));
+    if (start > coveredUntil) missingRanges.push({ start: coveredUntil, end: start });
+    coveredUntil = Math.max(coveredUntil, end);
+  }
+  if (coveredUntil < duration) missingRanges.push({ start: coveredUntil, end: duration });
+
+  return {
+    status: successful.length === 0 ? 'failed' : failedChunks.length > 0 ? 'partial' : 'complete',
+    totalChunks: chunkAttempts.length,
+    successfulChunks: successful.length,
+    failedChunks,
+    missingRanges,
+    duration,
+  };
+}
+
+function formatTranscriptionReportSummary(report) {
+  if (!report) return '转写内容不完整，请核对原音频后使用。';
+  const ranges = (report.missingRanges || []).map((range) => `${range.start.toFixed(1)}–${range.end.toFixed(1)} 秒`).join('；');
+  const errors = (report.failedChunks || []).map((chunk) => `第 ${chunk.index} 块：${chunk.error}`).join('；');
+  return `已处理 ${report.successfulChunks}/${report.totalChunks} 块。${ranges ? `缺失区间：${ranges}。` : ''}${errors ? `失败原因：${errors}。` : ''}部分结果不可当作完整逐字稿。`;
+}
+
+function finalizeTranscriptionResult(result, chunkAttempts, duration, untimedChunks = []) {
+  const report = createTranscriptionReport(chunkAttempts, duration);
+  if (untimedChunks.length > 0) report.untimedChunks = untimedChunks;
+  if (report.status === 'failed' || !String(result.srtContent || '').trim()) {
+    const message = report.status === 'failed'
+      ? `全部 ${report.totalChunks} 个音频分块转写失败，未生成字幕`
+      : '未识别到可导出的文字，请检查音频内容';
+    if (report.status !== 'failed') {
+      report.status = 'failed';
+      report.reason = 'no_text';
+    }
+    const error = new Error(message);
+    error.code = 'TRANSCRIPTION_FAILED';
+    error.transcriptionReport = report;
+    throw error;
+  }
+  return { ...result, transcriptionStatus: report.status, transcriptionReport: report };
+}
+
 /**
  * 检测 WebGPU 是否可用
  * @returns {Promise<boolean>}
@@ -5745,6 +5974,8 @@ async function initFrontendWhisper(onProgress) {
   console.log('在前端初始化 Whisper 模型...');
 
   try {
+    const availableModels = await preflightLocalWhisperModels();
+
     // 动态 import Transformers.js
     if (!frontendTransformersModule) {
       console.log('加载 Transformers.js (ES module)...');
@@ -5756,6 +5987,7 @@ async function initFrontendWhisper(onProgress) {
 
     // 配置本地模型
     env.allowLocalModels = true;
+    env.allowRemoteModels = false;
     env.useBrowserCache = false;
     env.localModelPath = chrome.runtime.getURL('models/');
 
@@ -5784,28 +6016,34 @@ async function initFrontendWhisper(onProgress) {
       }
     };
 
-    // 尝试 WebGPU 加载，失败则降级到 WASM
+    // 只尝试已安装的模型；初始化在音频下载之前完成，缺文件或运行时错误不会浪费下载。
     let loaded = false;
-
-    if (await isWebGPUAvailable()) {
+    const loadErrors = [];
+    for (const model of availableModels) {
       try {
-        const gpuModelPath = chrome.runtime.getURL('models/whisper-large-v3-turbo');
-        console.log('尝试 WebGPU + whisper-large-v3-turbo...');
-        if (onProgress) onProgress(5, 'WebGPU 模式，加载大型模型...');
+        const modelPath = chrome.runtime.getURL(`models/${model.name}`);
+        console.log('尝试本地模型:', model.name, model.device);
+        if (onProgress) onProgress(5, `加载本地模型 ${model.name}（${model.device}）...`);
 
-        frontendWhisperModel = await AutoModelForSpeechSeq2Seq.from_pretrained(gpuModelPath, {
-          device: 'webgpu',
-          dtype: 'q4f16',
+        frontendWhisperModel = await AutoModelForSpeechSeq2Seq.from_pretrained(modelPath, {
+          device: model.device,
+          dtype: model.dtype,
+          local_files_only: true,
           progress_callback: progressCallback,
         });
-        frontendWhisperProcessor = await AutoProcessor.from_pretrained(gpuModelPath);
-        frontendWhisperTokenizer = await AutoTokenizer.from_pretrained(gpuModelPath);
-        currentModelName = 'whisper-large-v3-turbo';
+        frontendWhisperProcessor = await AutoProcessor.from_pretrained(modelPath, { local_files_only: true });
+        frontendWhisperTokenizer = await AutoTokenizer.from_pretrained(modelPath, { local_files_only: true });
+        currentModelName = model.name;
         loaded = true;
-        console.log('WebGPU 模型加载成功');
-      } catch (gpuError) {
-        console.warn('WebGPU 加载失败，降级到 WASM:', gpuError.message);
-        // 清理可能的半加载状态
+        break;
+      } catch (modelError) {
+        loadErrors.push(`${model.name}: ${modelError.message || '加载失败'}`);
+        console.warn('本地模型加载失败:', model.name, modelError.message);
+        try {
+          await frontendWhisperModel?.dispose?.();
+        } catch (disposeError) {
+          console.warn('半加载模型释放失败:', disposeError.message);
+        }
         frontendWhisperModel = null;
         frontendWhisperProcessor = null;
         frontendWhisperTokenizer = null;
@@ -5813,17 +6051,7 @@ async function initFrontendWhisper(onProgress) {
     }
 
     if (!loaded) {
-      const cpuModelPath = chrome.runtime.getURL('models/whisper-small');
-      console.log('使用 WASM + whisper-small...');
-      if (onProgress) onProgress(5, 'WASM 模式，加载小型模型...');
-
-      frontendWhisperModel = await AutoModelForSpeechSeq2Seq.from_pretrained(cpuModelPath, {
-        progress_callback: progressCallback,
-      });
-      frontendWhisperProcessor = await AutoProcessor.from_pretrained(cpuModelPath);
-      frontendWhisperTokenizer = await AutoTokenizer.from_pretrained(cpuModelPath);
-      currentModelName = 'whisper-small';
-      console.log('WASM 模型加载成功');
+      throw new Error(`本地模型无法加载。请按 README 核对 ONNX 权重、配套文件及浏览器 GPU 支持后重新加载扩展。${loadErrors.join('；')}`);
     }
 
     // 运行库未传 language 时会默认英文，这里改成按当前分块语言动态注入。
@@ -5883,28 +6111,19 @@ async function transcribeAudioInFrontend(audioBuffer, onProgress) {
     const stepSamples = chunkSamples - strideSamples; // 实际步进 24 秒
 
     const allChunks = [];
+    const chunkAttempts = [];
+    const untimedChunks = [];
     let mergedText = '';
     let transcriptionLanguage = 'unknown';
+    let previousSuccessfulChunkIndex = -1;
+    let previousSuccessfulChunkWasTimed = false;
 
-    // 如果音频 <= 30 秒，直接处理
-    if (monoAudio.length <= chunkSamples) {
-      if (onProgress) onProgress(50, '处理音频特征...');
-      const { input_features } = await frontendWhisperProcessor(monoAudio);
-      if (onProgress) onProgress(55, '开始转写音频...');
-
-      const singleChunkResult = await transcribeSingleChunk(input_features, 0, onProgress);
-      transcriptionLanguage = normalizeWhisperLanguageCode(singleChunkResult.language);
-      const transcriptionResult = buildTranscriptionResultFromChunks(
-        singleChunkResult.chunks,
-        singleChunkResult.text,
-        transcriptionLanguage,
-      );
-      console.log('⏱️ 转写总耗时:', formatTranscriptionElapsedTime(performance.now() - transcriptionStartTime));
-      return transcriptionResult;
+    if (monoAudio.length === 0) {
+      return finalizeTranscriptionResult({ srtContent: '' }, [], 0);
     }
 
-    // 长音频：分块处理
-    const numChunks = Math.ceil(monoAudio.length / stepSamples);
+    // 首块覆盖 30 秒，之后每块新增 24 秒；不再额外处理已被前块完全覆盖的短尾块。
+    const numChunks = Math.max(1, 1 + Math.ceil((monoAudio.length - chunkSamples) / stepSamples));
     console.log('音频分块处理:', numChunks, '块, 每块', CHUNK_SECONDS, '秒, 重叠', STRIDE_SECONDS, '秒');
 
     let lastBlockEnd = performance.now();
@@ -5928,10 +6147,12 @@ async function transcribeAudioInFrontend(audioBuffer, onProgress) {
 
       console.log(`处理第 ${i + 1}/${numChunks} 块, 偏移: ${timeOffset.toFixed(1)}秒, 样本: ${start}-${end}`);
 
+      let inputFeatures = null;
       try {
         // 提取特征
         console.time(`[块${i + 1}] extract_features`);
         const { input_features } = await frontendWhisperProcessor(audioChunk);
+        inputFeatures = input_features;
         console.timeEnd(`[块${i + 1}] extract_features`);
 
         // 转写单个块
@@ -5947,26 +6168,44 @@ async function transcribeAudioInFrontend(audioBuffer, onProgress) {
         }
 
         console.time(`[块${i + 1}] 后处理`);
-        if (chunkResult.chunks.length > 0) {
-          allChunks.push(...chunkResult.chunks);
-        }
+        let nextMergedText = mergedText;
+        let hasUntimedText = false;
+        const hasValidTimestamps = Array.isArray(chunkResult.chunks) && chunkResult.chunks.some((chunk) => (
+          Array.isArray(chunk.timestamp) &&
+          Number.isFinite(chunk.timestamp[0]) &&
+          Number.isFinite(chunk.timestamp[1]) &&
+          chunk.timestamp[1] > chunk.timestamp[0]
+        ));
         if (chunkResult.text) {
           const activeLanguage = transcriptionLanguage !== 'unknown'
             ? transcriptionLanguage
             : chunkDetectedLanguage;
           const cleanedChunkText = cleanTranscriptionText(chunkResult.text, { language: activeLanguage });
-          const deduplicatedChunkText = mergedText
+          hasUntimedText = !!cleanedChunkText && !hasValidTimestamps;
+          // 失败块之间的文字没有共同音频边界，不可把真实重复表达误当作重叠删掉。
+          // 缺时间轴时也保留可能的重复，避免模糊匹配吞掉唯一保存的文字。
+          const deduplicatedChunkText = mergedText && previousSuccessfulChunkIndex === i - 1 && hasValidTimestamps && previousSuccessfulChunkWasTimed
             ? trimLeadingOverlapText(mergedText, cleanedChunkText, activeLanguage)
             : cleanedChunkText;
 
           if (deduplicatedChunkText) {
-            mergedText = mergedText ? `${mergedText}\n${deduplicatedChunkText}` : deduplicatedChunkText;
+            nextMergedText = mergedText ? `${mergedText}\n${deduplicatedChunkText}` : deduplicatedChunkText;
           }
         }
+        if (Array.isArray(chunkResult.chunks)) allChunks.push(...chunkResult.chunks);
+        mergedText = nextMergedText;
+        if (hasUntimedText) untimedChunks.push({ index: i + 1, start: timeOffset, end: end / SAMPLE_RATE });
+        previousSuccessfulChunkIndex = i;
+        previousSuccessfulChunkWasTimed = hasValidTimestamps;
+        chunkAttempts.push({ index: i + 1, start: timeOffset, end: end / SAMPLE_RATE, success: true });
         console.timeEnd(`[块${i + 1}] 后处理`);
       } catch (chunkError) {
-        // OOM 等错误时跳过当前块，继续处理后续块
-        console.warn(`第 ${i + 1} 块处理失败（可能内存不足），跳过:`, chunkError.message);
+        const message = chunkError?.message || String(chunkError);
+        chunkAttempts.push({ index: i + 1, start: timeOffset, end: end / SAMPLE_RATE, success: false, error: message });
+        console.warn(`第 ${i + 1} 块处理失败，保留缺失记录:`, message);
+        if (onProgress) onProgress(chunkProgress, `第 ${i + 1} 块失败，结果将标记为不完整`);
+      } finally {
+        if (inputFeatures) disposeTensorTree(inputFeatures);
       }
 
       console.timeEnd(`[块${i + 1}] 🔵 整块总耗时`);
@@ -5975,17 +6214,21 @@ async function transcribeAudioInFrontend(audioBuffer, onProgress) {
 
     if (onProgress) onProgress(95, '合并去重中...');
 
-    // 对重叠区域的片段进行去重（基于时间戳）
-    const deduplicatedChunks = deduplicateChunksByTime(allChunks);
+    // 任一有文字的分块缺少时间轴时，整份结果保留完整文字，不让部分时间轴掩盖其余文字。
+    // 不合成估计时间戳；此类结果可导出文本格式，但不能导出 SRT。
+    const deduplicatedChunks = untimedChunks.length > 0 ? [] : deduplicateChunksByTime(allChunks);
 
-    const transcriptionResult = buildTranscriptionResultFromChunks(
-      deduplicatedChunks,
-      mergedText,
-      transcriptionLanguage,
+    const transcriptionResult = finalizeTranscriptionResult(
+      buildTranscriptionResultFromChunks(deduplicatedChunks, mergedText, transcriptionLanguage),
+      chunkAttempts,
+      totalDuration,
+      untimedChunks,
     );
 
     console.log(
-      '全部转写完成, 原始片段:',
+      '转写任务结束, 状态:',
+      transcriptionResult.transcriptionStatus,
+      '原始片段:',
       allChunks.length,
       '个, 输出片段:',
       transcriptionResult.chunks.length,
@@ -6490,8 +6733,7 @@ function parseTimestampChunks(text, language = null) {
 }
 
 /**
- * 繁体中文转简体中文
- * Whisper 模型有时会输出繁体字，需要后处理转成简体
+ * 可选字符映射工具；当前转录和导出不自动调用，保留原文繁简。
  * @param {string} text - 包含繁体字的文本
  * @returns {string} 简体中文文本
  */
@@ -6964,12 +7206,11 @@ function traditionalToSimplified(text) {
 /**
  * 清理转写文本：移除 <|X.XX|> 时间戳标记、多余空白
  * @param {string} text - 原始转写文本
- * @param {{language?: string|null}|string|null} options - 文本语言，中文才做繁简转换
+ * @param {{language?: string|null}|string|null} options - 保留调用接口，不改变原文语言或繁简
  * @returns {string} 清理后的文本
  */
 function cleanTranscriptionText(text, options = {}) {
   if (!text) return text;
-  const language = typeof options === 'string' ? options : options?.language;
 
   // 移除 <|X.XX|> 时间戳标记
   let cleaned = text.replace(/<\|\d+\.\d+\|>/g, '');
@@ -6978,10 +7219,7 @@ function cleanTranscriptionText(text, options = {}) {
     return '';
   }
 
-  // 繁简转换只适用于中文；日文等非中文里存在共用汉字，不能直接套中文映射。
-  if (shouldApplyChineseTextNormalization(language)) {
-    cleaned = traditionalToSimplified(cleaned);
-  }
+  // 保留识别出的原文，繁简转换不能作为隐式清理步骤。
 
   // 只剩少量替换符时直接删除，整行明显乱码时上面已经过滤。
   cleaned = cleaned.replace(/\uFFFD/g, '');

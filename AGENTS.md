@@ -189,7 +189,8 @@ Cookie 读取顺序：
 本仓库无构建步骤，直接在 `chrome://extensions` 里以“已解压扩展”加载。
 
 注意：
-- `npm test` 只是占位脚本，不是真测试。
+- 本 fork 的 `npm test` 执行真实源码回归与侧栏模拟交互；使用 `npm ci --ignore-scripts` 安装开发测试依赖。
+- 提交前执行 `npm run check`、`npm test`、`npm run package`。模拟测试不替代 B 站实时接口与真实模型端到端验证。
 - 修改后要手动刷新扩展。
 - 回归至少覆盖：单视频字幕、批量字幕、收藏夹/合集导入、`SRT`/`TXT` 导出、Cookie 流程、音频转字幕、失败提示。
 
