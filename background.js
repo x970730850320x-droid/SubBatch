@@ -2461,6 +2461,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
               console.warn('发送进度消息失败:', e);
             }
           },
+          true,
         );
 
         if (!audioDataResult.success) {
@@ -2519,6 +2520,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         // 6. 转换为 SRT 格式
         console.log('步骤6: 转换为 SRT 格式');
         const srtContent = convertToSRT(transcribeResult.chunks);
+        if (!srtContent.trim()) throw new Error('未识别到可导出的文字，请检查音频内容');
 
         // 7. 返回结果
         console.log('音频转字幕完成');
@@ -2537,6 +2539,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         sendResponse({
           success: false,
           message: error.message || '音频转字幕失败',
+          transcriptionStatus: 'failed',
+          transcriptionReport: error.transcriptionReport || null,
         });
       }
     })();
@@ -3481,9 +3485,10 @@ async function getAllBilibiliCookies() {
  * @param {string} audioUrl - 音频流 URL
  * @param {number|null} tabId - B站页面的 tabId（用于通过 content script 下载）
  * @param {Function} onProgress - 进度回调
+ * @param {boolean} requireFrontendProcessing - 当前入口为 true，统一使用前端完整性检查
  * @returns {Promise<{success: boolean, audioBuffer?: AudioBuffer, audioData?: Uint8Array, needsProcessing?: boolean, message?: string}>}
  */
-async function fetchAndDecodeAudio(audioUrl, tabId, audioUrls, onProgress) {
+async function fetchAndDecodeAudio(audioUrl, tabId, audioUrls, onProgress, requireFrontendProcessing = false) {
   try {
     // 验证 URL
     if (!audioUrl || typeof audioUrl !== 'string' || audioUrl.trim() === '') {
@@ -3516,6 +3521,16 @@ async function fetchAndDecodeAudio(audioUrl, tabId, audioUrls, onProgress) {
       // 没有 tabId，只能尝试直接下载
       console.log('没有可用的 B站 标签页，尝试直接下载');
       arrayBuffer = await downloadAudioDirectly(audioUrl, audioUrls);
+    }
+
+    if (requireFrontendProcessing) {
+      // 当前转写入口统一交给前端分块处理，确保失败区间与部分结果不会被旧 pipeline 隐藏。
+      return {
+        success: true,
+        audioData: new Uint8Array(arrayBuffer),
+        needsProcessing: true,
+        message: '音频已下载，将在前端解码并逐块检查完整性',
+      };
     }
 
     if (onProgress) onProgress(50, 'decoding', '正在解码音频...');
@@ -3648,6 +3663,7 @@ class WhisperTranscriber {
 
       // 配置为允许本地模型
       env.allowLocalModels = true;
+      env.allowRemoteModels = false;
       env.useBrowserCache = true;
 
       // 获取模型路径
@@ -3657,6 +3673,8 @@ class WhisperTranscriber {
       // 创建语音识别 pipeline
       // 注意: 这里使用 'automatic-speech-recognition' 任务类型
       this.pipeline = await pipeline('automatic-speech-recognition', modelPath, {
+        local_files_only: true,
+        dtype: 'q8',
         progress_callback: (progress_info) => {
           console.log('Whisper 加载进度:', progress_info);
           if (onProgress && progress_info.progress !== undefined) {
